@@ -114,7 +114,7 @@ fn main() -> Result<()> {
     // ---- 第一遍：全部要解码 ----
     println!("第一遍：{take} 张缩略图（缓存为空）");
     pool.set_wanted(wanted.clone());
-    pool.submit(reqs.clone());
+    pool.request(reqs.clone(), livephoto_core::thumbs::Keep::Wanted);
 
     let t0 = std::time::Instant::now();
     let mut last_report = std::time::Instant::now();
@@ -170,7 +170,7 @@ fn main() -> Result<()> {
     println!("\n第二遍：同样的 {take} 张（应当全部命中磁盘缓存）");
     let done2 = done.load(Ordering::Relaxed);
     pool.set_wanted(wanted.clone());
-    pool.submit(reqs.clone());
+    pool.request(reqs.clone(), livephoto_core::thumbs::Keep::Wanted);
     let t1 = std::time::Instant::now();
     loop {
         if done.load(Ordering::Relaxed) >= done2 + take {

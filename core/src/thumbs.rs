@@ -125,6 +125,19 @@ pub struct ThumbPool {
     workers: usize,
 }
 
+/// 提交任务时对"保活"的要求。
+///
+/// 池子的工作线程在取出任务前会检查"这个键现在还需要吗"，不需要就丢弃。
+/// 这个检查以前是**隐式**的：调用方必须自己记得成对调用 `set_wanted` 或 `pin`，
+/// 忘了就会被**静默丢弃**。现在改成由 `request()` 显式声明。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Keep {
+    /// 依赖调用方随后的 `set_wanted`（网格可见区；注意 `set_wanted` 会整体替换集合）
+    Wanted,
+    /// 钉住：不会被 `set_wanted` 清掉（胶片条、全屏层这类"不属于网格窗口"的请求）
+    Pinned,
+}
+
 impl ThumbPool {
     pub fn new(
         workers: usize,
@@ -183,11 +196,25 @@ impl ThumbPool {
         self.workers
     }
 
-    /// 提交任务。同名键已在队列里的会被更新（**以最新批次为准**）。
-    pub fn submit(&self, reqs: Vec<ThumbRequest>) {
+    /// 提交任务的**唯一入口**。`keep` 决定这些键怎么保活。
+    ///
+    /// 为什么合成一个入口：工作线程在取出任务前会检查"这个键现在还需要吗"，
+    /// 不需要就丢弃。这个检查以前是隐式的 —— 调用方必须自己记得成对调用
+    /// `set_wanted` 或 `pin`，忘了就被**静默丢弃**（实测踩过：胶片条的请求
+    /// 计数涨到 297 却零产出）。现在"提交但不声明"在签名上写不出来。
+    pub fn request(&self, reqs: Vec<ThumbRequest>, keep: Keep) {
         // 每次调用算一个新批次号：本批次里的优先级是"相对当前焦点"算出来的，
         // 所以它比队列里旧批次的值更权威（哪怕旧值是 0）。
         let seq = self.inner.submit_counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if keep == Keep::Pinned {
+            // 提交即声明，不再依赖调用方记得去 pin
+            let mut pinned = self.inner.pinned.lock().unwrap();
+            for r in &reqs {
+                pinned.insert(r.key.clone());
+            }
+        }
+
         {
             let mut q = self.inner.queue.lock().unwrap();
             let mut seqs = self.inner.job_seq.lock().unwrap();

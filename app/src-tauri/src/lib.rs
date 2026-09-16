@@ -10,8 +10,9 @@
 //! - 缩略图通过自定义协议 `thumb://` 提供（本机是 `http://thumb.localhost/<key>`），
 //!   由 Rust 直接吐缓存文件，不走 IPC 序列化。
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use serde::Serialize;
 use tauri::http::{Request, Response};
@@ -21,8 +22,8 @@ use livephoto_core::cache::{CacheStats, ThumbCache};
 use livephoto_core::files::scan_tree;
 use livephoto_core::pairing::{pair_all, Asset, Kind};
 use livephoto_core::thumbs::{
-    PoolStats, ThumbPool, ThumbRequest, JPEG_QUALITY, SCREEN_DIM, SCREEN_JPEG_QUALITY, TIER_DIM,
-    TIER_GRID, TIER_SCREEN,
+    Keep, PoolStats, ThumbPool, ThumbRequest, JPEG_QUALITY, SCREEN_DIM, SCREEN_JPEG_QUALITY,
+    TIER_DIM, TIER_GRID, TIER_SCREEN,
 };
 
 /// 工作线程数：实测加线程不但无益反而有害（6 线程比单线程还慢），
@@ -100,6 +101,145 @@ struct AppState {
     /// 但必须钉住 —— 否则工作线程取出任务时会因为"不在 wanted/pinned 集合里"把它丢掉，
     /// 表现就是"提交了但永远不出图"。
     strip_keys: Mutex<Vec<String>>,
+    /// 协议层取证计数（见 `MediaStats`）
+    media: MediaStats,
+}
+
+/// 自定义协议处理的取证计数。
+///
+/// 为什么要有：用户反馈"有些视频点开直接卡死"，而我看不到屏幕。
+/// 有了它，"点开一个视频到底请求了多少分片、读了多少字节、单次读盘最慢多久"
+/// 都是可测的数字，而不是猜。
+#[derive(Default)]
+struct MediaStats {
+    requests: AtomicU64,
+    bytes: AtomicU64,
+    /// 单次请求的读盘+拷贝耗时（毫秒）
+    read_ms_max: AtomicU64,
+    read_ms_total: AtomicU64,
+    /// 被分片截断的请求数（正常播放器会继续请求下一片）
+    capped: AtomicU64,
+    /// 队列积压峰值（读盘线程不够用时会涨）
+    queue_max: AtomicU64,
+    /// 媒体请求到达时，缩略图队列里还压着多少个（说明"播放要排在缩略图后面"）
+    behind_thumb: AtomicU64,
+}
+
+/// 协议处理用的固定线程池（**媒体优先的双队列**）。
+///
+/// **为什么必须有它**：Tauri 的同步自定义协议处理器是在 WebView2 的 UI 线程上
+/// **同步执行**的（wry 0.55 `webview2/mod.rs` 的 `add_WebResourceRequested` 回调里
+/// 直接调用 handler，`respond` 返回的响应就地 `SetResponse`）。
+/// 也就是说，在 `serve_media` 里读文件 = 在**主线程**上读文件，整个界面停摆。
+///
+/// 而播放器发的第一个请求是 `Range: bytes=0-`（开放式范围）。本机有一个
+/// 2.08GB 的 4K 视频，旧代码会把 2.08GB 一次性读进内存再交出去 ——
+/// 实测宿主进程私有内存在 100 秒内从 10MB 涨到 4277MB，用户看到的就是
+/// "点开这个视频直接卡死"。
+///
+/// 两道防线：
+///   1. 单次响应有上限（`LIVEPHOTO_MEDIA_CHUNK`，默认 4MB），不再整文件读；
+///   2. 读盘搬到本线程池（`register_asynchronous_uri_scheme_protocol`），
+///      哪怕真读了 4MB，也**不在 UI 线程**上读。
+///
+/// **为什么还分两个队列**：网格首屏会瞬间打出成百上千个缩略图请求
+/// （918 个视频资产还要靠 MF 抽帧，很慢），如果和播放请求挤同一条先进先出队列，
+/// 视频就会排在缩略图后面 —— 表现是"点了播放半天不动"（实测在首屏加载期间
+/// 复现过：`mediaTest` 6 秒都没到 canplay，而同一份文件在首屏安静时 274ms 就到了）。
+/// 所以缩略图归缩略图，媒体随时插到最前。
+struct IoPool {
+    queues: Mutex<IoQueues>,
+    cv: Condvar,
+    media_jobs: AtomicU64,
+    thumb_jobs: AtomicU64,
+}
+
+type IoJob = Box<dyn FnOnce() + Send>;
+
+#[derive(Default)]
+struct IoQueues {
+    /// 播放请求：永远先被取走
+    media: VecDeque<IoJob>,
+    /// 缩略图请求：可被媒体插队
+    thumb: VecDeque<IoJob>,
+}
+
+impl IoPool {
+    fn new(threads: usize) -> Arc<Self> {
+        let pool = Arc::new(Self {
+            queues: Mutex::new(IoQueues::default()),
+            cv: Condvar::new(),
+            media_jobs: AtomicU64::new(0),
+            thumb_jobs: AtomicU64::new(0),
+        });
+        for i in 0..threads.max(1) {
+            let p = pool.clone();
+            std::thread::Builder::new()
+                .name(format!("lp-io-{i}"))
+                .spawn(move || p.worker())
+                .expect("启动协议 IO 线程失败");
+        }
+        pool
+    }
+
+    fn worker(&self) {
+        loop {
+            // 同一把锁里先扫媒体队列再扫缩略图队列，取任务与等待是原子的，
+            // 不存在"通知丢了、任务一直躺着"的竞态。
+            let job = {
+                let mut g = self.queues.lock().unwrap();
+                loop {
+                    if let Some(j) = g.media.pop_front() {
+                        break j;
+                    }
+                    if let Some(j) = g.thumb.pop_front() {
+                        break j;
+                    }
+                    g = self.cv.wait(g).unwrap();
+                }
+            };
+            job();
+        }
+    }
+
+    fn spawn_media(&self, job: impl FnOnce() + Send + 'static) {
+        self.media_jobs.fetch_add(1, Ordering::Relaxed);
+        self.queues.lock().unwrap().media.push_back(Box::new(job));
+        self.cv.notify_one();
+    }
+
+    fn spawn_thumb(&self, job: impl FnOnce() + Send + 'static) {
+        self.thumb_jobs.fetch_add(1, Ordering::Relaxed);
+        self.queues.lock().unwrap().thumb.push_back(Box::new(job));
+        self.cv.notify_one();
+    }
+
+    fn media_depth(&self) -> u64 {
+        self.queues.lock().unwrap().media.len() as u64
+    }
+
+    fn thumb_depth(&self) -> u64 {
+        self.queues.lock().unwrap().thumb.len() as u64
+    }
+}
+
+/// 协议 IO 线程数。读盘是短任务（≤4MB），4 个足够覆盖"网格缩略图 + 视频分片"的并发。
+fn io_threads() -> usize {
+    std::env::var("LIVEPHOTO_IO_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(4)
+}
+
+/// 单次媒体响应的字节上限。`0` = 不限制（**只用于复现老版本的卡死**，取证用）。
+fn media_chunk_limit() -> u64 {
+    match std::env::var("LIVEPHOTO_MEDIA_CHUNK")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(v) => v,
+        None => 4 * 1024 * 1024,
+    }
 }
 
 impl AppState {
@@ -110,6 +250,7 @@ impl AppState {
             cache: Some(cache),
             screen_keys: Mutex::new(Vec::new()),
             strip_keys: Mutex::new(Vec::new()),
+            media: MediaStats::default(),
         }
     }
 
@@ -458,8 +599,10 @@ fn set_visible(state: tauri::State<'_, Arc<AppState>>, ids: Vec<usize>) -> Resul
     let pool = state.pool.lock().unwrap();
     let pool = pool.as_ref().ok_or("工作池未就绪")?;
     let n = reqs.len();
+    // 顺序有意义：先声明"窗口内需要的键"（顺带把滑出窗口的旧任务清掉），
+    // 再提交本批。反过来提交刚入队的任务会被 set_wanted 立刻裁掉。
     pool.set_wanted(wanted);
-    pool.submit(reqs);
+    pool.request(reqs, Keep::Wanted);
     Ok(n)
 }
 
@@ -517,7 +660,9 @@ fn request_screens(
     let pool = state.pool.lock().unwrap();
     let pool = pool.as_ref().ok_or("工作池未就绪")?;
 
-    // 只解绑"这一批不再需要"的旧键，避免误伤正在算的任务
+    // 只解绑"这一批不再需要"的旧键，避免误伤正在算的任务。
+    // 新键的钉住由 `request(..., Keep::Pinned)` 负责 —— 以前这里是"手工 pin 一遍
+    // 再 submit"，一旦漏了 pin 就会被静默丢弃，现在这个失误在类型上写不出来。
     let new_set: std::collections::HashSet<&String> = keys.iter().collect();
     {
         let mut prev = state.screen_keys.lock().unwrap();
@@ -526,15 +671,10 @@ fn request_screens(
                 pool.unpin(old);
             }
         }
-        for k in &keys {
-            if !prev.contains(k) {
-                pool.pin(k);
-            }
-        }
         *prev = keys.clone();
     }
 
-    pool.submit(reqs);
+    pool.request(reqs, Keep::Pinned);
     Ok(keys)
 }
 
@@ -577,9 +717,9 @@ fn request_grid(state: tauri::State<'_, Arc<AppState>>, ids: Vec<usize>) -> Resu
     let pool = state.pool.lock().unwrap();
     let pool = pool.as_ref().ok_or("工作池未就绪")?;
 
-    // **必须钉住**：只 submit 不声明的话，工作线程取出任务时会判定"不需要"而丢弃。
+    // **必须钉住**：只提交不声明的话，工作线程取出任务时会判定"不需要"而丢弃。
     // 这正是"网格能加载、胶片条不行"的原因 —— 网格走 set_visible（同时声明 wanted），
-    // 而这里一开始只提交了任务。
+    // 而这里一开始只提交了任务。现在 `Keep::Pinned` 让"提交"与"声明"绑成一次调用。
     let new_set: std::collections::HashSet<&String> = keys.iter().collect();
     {
         let mut prev = state.strip_keys.lock().unwrap();
@@ -588,15 +728,10 @@ fn request_grid(state: tauri::State<'_, Arc<AppState>>, ids: Vec<usize>) -> Resu
                 pool.unpin(old);
             }
         }
-        for k in &keys {
-            if !prev.contains(k) {
-                pool.pin(k);
-            }
-        }
         *prev = keys;
     }
 
-    pool.submit(reqs);
+    pool.request(reqs, Keep::Pinned);
     Ok(n)
 }
 
@@ -664,8 +799,7 @@ fn request_screen(state: tauri::State<'_, Arc<AppState>>, id: usize) -> Result<S
 
     let pool = state.pool.lock().unwrap();
     let pool = pool.as_ref().ok_or("工作池未就绪")?;
-    pool.pin(&key);
-    pool.submit(vec![req]);
+    pool.request(vec![req], Keep::Pinned);
     Ok(key)
 }
 
@@ -737,6 +871,48 @@ fn initial_folder() -> Option<String> {
 #[tauri::command]
 fn worker_count_cmd() -> usize {
     worker_count()
+}
+
+/// 协议层的取证计数（前端自检在每个文件前后各取一次快照，差值就是"这个文件拉了多少数据"）。
+#[tauri::command]
+fn media_stats(state: tauri::State<'_, Arc<AppState>>) -> serde_json::Value {
+    let m = &state.media;
+    serde_json::json!({
+        "requests": m.requests.load(Ordering::Relaxed),
+        "bytes": m.bytes.load(Ordering::Relaxed),
+        "readMsMax": m.read_ms_max.load(Ordering::Relaxed),
+        "readMsTotal": m.read_ms_total.load(Ordering::Relaxed),
+        "capped": m.capped.load(Ordering::Relaxed),
+        "queueMax": m.queue_max.load(Ordering::Relaxed),
+        "behindThumbMax": m.behind_thumb.load(Ordering::Relaxed),
+        "chunkLimit": media_chunk_limit(),
+    })
+}
+
+/// 视频扫描自检的开关与参数，来自环境变量。
+///
+/// 为什么要做成"环境变量驱动"而不是"改代码重编"：排查"某些视频点开卡死"时
+/// 需要反复调整样本数和超时，重编一次 release 要 5 分钟；而且要能在**最终用户
+/// 装的那个 exe** 上直接跑取证，而不是只能在我自己改过的构建里跑。
+/// 默认关闭，普通用户零开销。
+///
+/// - `LIVEPHOTO_SWEEP=<样本数>`：设置后启用（例如 24）
+/// - `LIVEPHOTO_SWEEP_TIMEOUT=<毫秒>`：单个文件等待上限，默认 6000
+#[tauri::command]
+fn probe_plan() -> serde_json::Value {
+    let limit: usize = std::env::var("LIVEPHOTO_SWEEP")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    let timeout_ms: u64 = std::env::var("LIVEPHOTO_SWEEP_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(6000);
+    serde_json::json!({
+        "enabled": limit > 0,
+        "limit": limit,
+        "timeoutMs": timeout_ms,
+    })
 }
 
 /// 清空缩略图缓存（纯派生数据，删了不丢照片）。
@@ -853,23 +1029,44 @@ fn serve_media(shared: &Arc<AppState>, req: Request<Vec<u8>>) -> Response<Vec<u8
         });
 
     use std::io::{Read, Seek, SeekFrom};
-    let (start, end, status) = match range {
-        Some((a, b)) => {
-            let a = a.min(total.saturating_sub(1));
-            let b = b.min(total.saturating_sub(1));
-            if a > b {
-                return Response::builder()
-                    .status(416)
-                    .header("Content-Range", format!("bytes */{total}"))
-                    .body(Vec::new())
-                    .unwrap();
-            }
-            (a, b, 206)
+
+    // 单次响应的最大字节数。
+    //
+    // **必须分块**：播放器发的第一个请求是 `Range: bytes=0-`（开放式范围），
+    // 若不设上限就会退化成"读整个文件"—— 本机有个 219MB 的 4K 视频，
+    // 一次 `vec![0u8; 219MB]` 会让应用直接卡死（用户实测反馈）。
+    // 分块返回 206 本来就是媒体播放器的正常路径，它会继续按需请求后续分片。
+    //
+    // 可用 `LIVEPHOTO_MEDIA_CHUNK` 覆盖（`0` = 关闭限制，仅用于复现老行为取证）。
+    let max_chunk = media_chunk_limit();
+
+    let want_range = range.is_some();
+    let (mut start, mut end) = range.unwrap_or((0, total.saturating_sub(1)));
+    if total == 0 {
+        return notfound("empty file");
+    }
+    start = start.min(total - 1);
+    end = end.min(total - 1);
+    let mut capped = false;
+    if max_chunk > 0 {
+        let lim = start.saturating_add(max_chunk - 1);
+        if end > lim {
+            end = lim;
+            capped = true;
         }
-        None => (0, total.saturating_sub(1), 200),
-    };
+    }
+    if start > end {
+        return Response::builder()
+            .status(416)
+            .header("Content-Range", format!("bytes */{total}"))
+            .body(Vec::new())
+            .unwrap();
+    }
+    // 只有"没被截断 + 客户端没要范围"时才回 200，否则一律 206
+    let status = if !want_range && !capped { 200 } else { 206 };
     let len = end - start + 1;
 
+    let t_read = std::time::Instant::now();
     let mut buf = vec![0u8; len as usize];
     if let Ok(mut f) = std::fs::File::open(&file_path) {
         if f.seek(SeekFrom::Start(start)).is_ok() && f.read_exact(&mut buf).is_err() {
@@ -878,7 +1075,34 @@ fn serve_media(shared: &Arc<AppState>, req: Request<Vec<u8>>) -> Response<Vec<u8
     } else {
         return notfound("open failed");
     }
+    let read_ms = t_read.elapsed().as_millis() as u64;
 
+    // 取证计数
+    shared.media.requests.fetch_add(1, Ordering::Relaxed);
+    shared.media.bytes.fetch_add(len, Ordering::Relaxed);
+    if capped {
+        shared.media.capped.fetch_add(1, Ordering::Relaxed);
+    }
+    shared
+        .media
+        .read_ms_total
+        .fetch_add(read_ms, Ordering::Relaxed);
+    shared
+        .media
+        .read_ms_max
+        .fetch_max(read_ms, Ordering::Relaxed);
+    if std::env::var("LIVEPHOTO_MEDIA_LOG").is_ok() {
+        println!(
+            "[media] v{} {}..{} / {} ({:.1}MB) read={}ms status={}",
+            kind,
+            start,
+            end,
+            total,
+            len as f64 / 1048576.0,
+            read_ms,
+            status
+        );
+    }
     let mut b = Response::builder()
         .status(status)
         .header("Content-Type", ctype)
@@ -909,15 +1133,67 @@ pub fn run() {
     let shared: Arc<AppState> = Arc::new(AppState::new(cache));
     let shared_for_media = shared.clone();
 
-    tauri::Builder::default()
+    // 协议读盘线程池：**必须**，否则读盘发生在 WebView2 的 UI 线程上（见 IoPool 注释）
+    let io = IoPool::new(io_threads());
+    let io_for_media = io.clone();
+    let io_for_thumb = io.clone();
+
+    // 取证开关：强制用"同步协议 + 不限分片"注册，也就是**老版本的行为**。
+    // 存在的唯一目的是做同二进制 A/B：同一台机器、同一个文件、同一份前端，
+    // 只切换这一个变量，看主线程停顿是真的消失还是只是被别的东西遮住了。
+    // 正常用户不会设置这个环境变量，默认路径永远是异步 + 分片。
+    let legacy_protocol = std::env::var("LIVEPHOTO_SYNC_PROTOCOL").is_ok();
+    println!(
+        "[livephoto] 协议模式: {} · 单次分片上限: {} · IO 线程: {}",
+        if legacy_protocol { "同步(老行为)" } else { "异步" },
+        match media_chunk_limit() {
+            0 => "不限".to_string(),
+            v => format!("{:.1}MB", v as f64 / 1048576.0),
+        },
+        io_threads()
+    );
+
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(shared)
-        .register_uri_scheme_protocol("thumb", move |_ctx, req| {
-            serve_thumb(&cache_for_protocol, req)
-        })
-        .register_uri_scheme_protocol("media", move |_ctx, req| {
-            serve_media(&shared_for_media, req)
-        })
+        .manage(shared);
+
+    if legacy_protocol {
+        let cache_for_sync = cache_for_protocol.clone();
+        builder = builder
+            .register_uri_scheme_protocol("thumb", move |_ctx, req| {
+                serve_thumb(&cache_for_sync, req)
+            })
+            .register_uri_scheme_protocol("media", {
+                let shared = shared_for_media.clone();
+                move |_ctx, req| serve_media(&shared, req)
+            });
+    } else {
+        // 异步版协议：handler 在 IO 线程池里跑，读盘彻底离开 UI 线程
+        builder = builder
+            .register_asynchronous_uri_scheme_protocol("thumb", move |_ctx, req, responder| {
+                let cache = cache_for_protocol.clone();
+                io_for_thumb.spawn_thumb(move || {
+                    responder.respond(serve_thumb(&cache, req));
+                });
+            })
+            .register_asynchronous_uri_scheme_protocol("media", move |_ctx, req, responder| {
+                let shared = shared_for_media.clone();
+                let depth = io_for_media.media_depth() + 1;
+                shared.media.queue_max.fetch_max(depth, Ordering::Relaxed);
+                let thumb_waiting = io_for_media.thumb_depth();
+                if thumb_waiting > 0 {
+                    shared
+                        .media
+                        .behind_thumb
+                        .fetch_max(thumb_waiting, Ordering::Relaxed);
+                }
+                io_for_media.spawn_media(move || {
+                    responder.respond(serve_media(&shared, req));
+                });
+            });
+    }
+
+    builder
         .invoke_handler(tauri::generate_handler![
             open_folder,
             list_assets,
@@ -937,6 +1213,8 @@ pub fn run() {
             clear_cache,
             initial_folder,
             worker_count_cmd,
+            probe_plan,
+            media_stats,
             debug_report
         ])
         .setup(|app| {

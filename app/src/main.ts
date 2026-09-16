@@ -129,6 +129,7 @@ const diag = {
   stripHistory: [] as Array<{ t: number; cur: number; s: string; ids: number[] }>,
   stripMissingRequests: 0,
   lastOpenPrecached: null as unknown,
+  videoSweep: null as unknown,
   startedAt: Date.now(),
 };
 
@@ -191,6 +192,7 @@ async function flushDiag(tag: string) {
       screenTest: diag.screenTest,
       strip: diag.strip,
       stripHistory: diag.stripHistory,
+      videoSweep: diag.videoSweep,
       screenCachedCount: screenCached.size,
       stripMissingRequests: diag.stripMissingRequests,
       lastOpenWasPrecached: diag.lastOpenPrecached,
@@ -618,17 +620,23 @@ async function openViewer(id: number) {
     if (d.video_duration_ms) bits.push(`${(d.video_duration_ms / 1000).toFixed(1)}s`);
     bits.push(new Date(d.mtime * 1000).toLocaleString("zh-CN"));
     vMeta.textContent = bits.join(" · ");
-    // 有视频轨就给出 LIVE 播放入口
-    if (d.kind === "live" || d.video_path) {
+    // 播放入口：**只有真正的 Live Photo 才自动播放**。
+    // 普通视频（有些是几百 MB 的 4K 片子）绝不自动播 —— 那既不是用户意图，
+    // 也会在大文件上瞬间拉满带宽/IO。
+    if (d.kind === "live") {
       vLive.classList.remove("hidden");
       vMute.classList.remove("hidden");
       vLive.textContent = "LIVE ▶";
       applyMute();
-      // **切过去自动播放**（对齐 iOS 相册：滑到 Live Photo 就播一遍）。
-      // 等一拍再用张图替换帧，避免和上方"读缓存键"的异步流程打架。
       window.setTimeout(() => {
         if (viewerId === id) void playLive();
       }, 260);
+    } else if (d.video_path) {
+      vLive.classList.remove("hidden");
+      vMute.classList.remove("hidden");
+      vLive.textContent = "▶ 播放";
+      applyMute();
+      // 不自动播放，等用户点
     } else {
       vLive.classList.add("hidden");
       vMute.classList.add("hidden");
@@ -819,20 +827,33 @@ let dragStartX = 0;
 let dragStartY = 0;
 let dragTx = 0;
 let dragTy = 0;
+/** 本次按下之后指针是否真的移动过（≥3px）。原地点击不该被当成拖拽。 */
+let dragMoved = false;
+/** 拖拽后紧跟的 click 要忽略（否则平移一下就把查看器关了） */
+let suppressNextClick = false;
 
 vStage.addEventListener("pointerdown", (e) => {
   if (viewerId === null || vZoom <= 1.01) return;
   dragging = true;
+  dragMoved = false;
   dragStartX = e.clientX;
   dragStartY = e.clientY;
   dragTx = vTx;
   dragTy = vTy;
   vStage.classList.add("dragging");
-  vStage.setPointerCapture(e.pointerId);
+  // 合成事件（自检）没有活动指针，setPointerCapture 会抛异常；真实输入不会。
+  try {
+    vStage.setPointerCapture(e.pointerId);
+  } catch {
+    /* 忽略 */
+  }
 });
 
 vStage.addEventListener("pointermove", (e) => {
   if (!dragging) return;
+  if (Math.abs(e.clientX - dragStartX) > 3 || Math.abs(e.clientY - dragStartY) > 3) {
+    dragMoved = true;
+  }
   vTx = dragTx + (e.clientX - dragStartX);
   vTy = dragTy + (e.clientY - dragStartY);
   clampPan();
@@ -843,9 +864,33 @@ const endDrag = () => {
   if (!dragging) return;
   dragging = false;
   vStage.classList.remove("dragging");
+  // 真拖过才抑制后面的 click；原地点击必须保留（否则"放大后点一下"会变成什么都不发生）
+  if (dragMoved) {
+    suppressNextClick = true;
+    window.setTimeout(() => {
+      suppressNextClick = false;
+    }, 0);
+  }
 };
 vStage.addEventListener("pointerup", endDrag);
 vStage.addEventListener("pointercancel", endDrag);
+
+/**
+ * 光标是否落在大图（缩放/平移之后）的可视矩形内。
+ *
+ * 为什么不能只看 `e.target`：放大状态下一按下就 `setPointerCapture(vStage)`，
+ * 于是随后的 click **总是**以 `vStage` 为 target —— 看起来"点在照片上"，
+ * 其实 target 是底背景，旧逻辑就会把查看器关掉（用户反馈的
+ * "放大后鼠标点一下就退回小图"）。所以这里用几何判断。
+ */
+function pointInsideImage(clientX: number, clientY: number): boolean {
+  const st = vStage.getBoundingClientRect();
+  const baseL = st.left + (st.width - vFitW) / 2 + vTx;
+  const baseT = st.top + (st.height - vFitH) / 2 + vTy;
+  const w = vFitW * vZoom;
+  const h = vFitH * vZoom;
+  return clientX >= baseL && clientX <= baseL + w && clientY >= baseT && clientY <= baseT + h;
+}
 
 // 双击复位
 vStage.addEventListener("dblclick", () => {
@@ -1191,7 +1236,14 @@ function viewerStep(delta: number) {
 
 $<HTMLButtonElement>("vClose").addEventListener("click", () => closeViewer());
 viewerEl.addEventListener("click", (e) => {
+  // 拖拽后紧跟的 click 忽略掉
+  if (suppressNextClick) return;
   const t = e.target as HTMLElement;
+  // **点图片/视频本身绝不关闭** —— 放大后拖动或点一下看图是常规操作，
+  // 之前这里只要目标是 stage 就关，导致"放大后点一下就退回小图"（用户反馈）。
+  if (t === vImg || t === vVid) return;
+  // 放大时指针被 capture 到 vStage，target 已经不可信，改用几何判断
+  if (vZoom > 1.01 && pointInsideImage(e.clientX, e.clientY)) return;
   if (t === viewerEl || t.id === "vStage") closeViewer();
 });
 
@@ -1638,6 +1690,7 @@ function viewerSelfTest() {
     // 大图缩放缓验：在舞台中心合成一次滚轮，看 vZoom 是否变化
     let zoomBefore = 0;
     let zoomAfter = 0;
+    let clickTest: Record<string, unknown> | null = null;
     try {
       const st = vStage.getBoundingClientRect();
       zoomBefore = vZoom;
@@ -1651,9 +1704,10 @@ function viewerSelfTest() {
         }),
       );
       zoomAfter = vZoom;
+      clickTest = viewerClickSelfTest(st);
       resetZoom();
-    } catch {
-      /* 忽略：缩放自检失败不该影响其它验收 */
+    } catch (e) {
+      clickTest = { error: String(e) };
     }
     diag.viewerTest = {
       opened: diag.viewerOpen,
@@ -1667,10 +1721,65 @@ function viewerSelfTest() {
       zoomWorks: zoomAfter > zoomBefore,
       fitW: Math.round(vFitW),
       fitH: Math.round(vFitH),
+      clickTest,
     };
     closeViewer();
     void flushDiag("viewer-selftest");
   }, 2500);
+}
+
+/**
+ * "放大之后点一下会不会退回小图"的自检。
+ *
+ * 用户反馈的原始现象：放大后鼠标点一下，直接退回网格。
+ * 根因是 WebView2 里 `setPointerCapture` 会把随后的 click 的 target 改成捕获元素
+ * （也就是 `vStage`），于是"点在照片上"在事件里看起来和"点底背景"完全一样，
+ * 旧逻辑就把查看器关了。
+ *
+ * 这里合成两次点击，把两种意图分开验证：
+ *   1. 放大状态下点在**照片范围内** → 查看器必须还开着（修复点）
+ *   2. 缩放复位后点在**舞台角落**（照片外）→ 查看器必须关闭（保留"点空白退出"）
+ */
+function viewerClickSelfTest(st: DOMRect): Record<string, unknown> {
+  const cx = st.left + st.width / 2;
+  const cy = st.top + st.height / 2;
+  const hitInside = pointInsideImage(cx, cy);
+  // 放大状态下按一下再抬起（模拟真实的"点一下"，不是拖拽）
+  vStage.dispatchEvent(
+    new PointerEvent("pointerdown", { pointerId: 1, clientX: cx, clientY: cy, bubbles: true }),
+  );
+  vStage.dispatchEvent(
+    new PointerEvent("pointerup", { pointerId: 1, clientX: cx, clientY: cy, bubbles: true }),
+  );
+  const idBefore = viewerId;
+  vStage.dispatchEvent(
+    new MouseEvent("click", { clientX: cx, clientY: cy, bubbles: true, cancelable: true }),
+  );
+  const stayedAfterImageClick = viewerId === idBefore;
+
+  // 场景 2：复位缩放，点照片之外的角落
+  resetZoom();
+  const cornerX = st.left + 2;
+  const cornerY = st.top + 2;
+  const hitCorner = pointInsideImage(cornerX, cornerY);
+  vStage.dispatchEvent(
+    new MouseEvent("click", {
+      clientX: cornerX,
+      clientY: cornerY,
+      bubbles: true,
+      cancelable: true,
+    }),
+  );
+  const closedOnBackdropClick = viewerId === null;
+
+  return {
+    zoomAtTest: vZoom,
+    hitInside,
+    stayedAfterImageClick,
+    hitCorner,
+    closedOnBackdropClick,
+    pass: hitInside && stayedAfterImageClick && !hitCorner && closedOnBackdropClick,
+  };
 }
 
 /**
@@ -1856,6 +1965,253 @@ async function screenSelfTest() {
   void flushDiag("screen-selftest");
 }
 
+/* ------------------------------------------------------------------ *
+ * 视频扫描自检：定位"有些视频文件点开直接卡死"
+ *
+ * 动机（用户实测反馈）：某些视频点开就卡死。这句话里有两种完全不同的故障，
+ * 必须用数字把它们区分开，不能靠猜：
+ *   a) 主线程被同步工作堵住 → 页面自己的定时器都会停摆（能测出"停顿"）
+ *   b) 单个文件解码/请求失败  → <video> 会给 error / 一直 timeout（能测出 error）
+ *
+ * 做法：逐个真加载 `<video>`（隐藏元素，走的就是产品里完全相同的
+ * `media://` 协议 + Range 路径），同时跑一个 50ms 心跳记录主线程最大停顿。
+ * **每测完一个文件就写盘一次** —— 万一真的把应用卡死，最后落盘的 JSON
+ * 就精确指出了是哪个文件、哪个字节数。
+ *
+ * 触发方式：环境变量 `LIVEPHOTO_SWEEP=<样本数>`（默认关闭，普通用户零开销）。
+ * ------------------------------------------------------------------ */
+type StallWatch = { timer: number; max: number; count: number; last: number; samples: number[] };
+
+function startStallWatch(): StallWatch {
+  const w: StallWatch = { timer: 0, max: 0, count: 0, last: performance.now(), samples: [] };
+  w.timer = window.setInterval(() => {
+    const now = performance.now();
+    const gap = now - w.last;
+    w.last = now;
+    if (gap > 120) {
+      w.count++;
+      w.samples.push(Math.round(gap));
+      if (gap > w.max) w.max = gap;
+    }
+  }, 50);
+  return w;
+}
+
+async function probeOneVideo(id: number, timeoutMs: number) {
+  const url = `${MEDIA_BASE}/v/${id}`;
+  let detail: any = null;
+  try {
+    detail = await invoke<any>("asset_detail", { id });
+  } catch {
+    /* detail 只是补充信息，拿不到也能测 */
+  }
+
+  // 协议层快照：这个文件到底拉了多少分片、多少字节、单次读盘最慢多久
+  const snap = async () => {
+    try {
+      return await invoke<any>("media_stats");
+    } catch {
+      return null;
+    }
+  };
+  const before = await snap();
+
+  const v = document.createElement("video");
+  v.muted = true;
+  v.preload = "auto";
+  v.style.cssText = "position:absolute;left:-9999px;top:0;width:2px;height:2px;opacity:0";
+  document.body.appendChild(v);
+
+  const t0 = performance.now();
+  const marks: Record<string, number> = {};
+  for (const n of [
+    "loadstart",
+    "loadedmetadata",
+    "loadeddata",
+    "canplay",
+    "canplaythrough",
+    "stalled",
+    "suspend",
+    "error",
+    "abort",
+  ]) {
+    v.addEventListener(n, () => {
+      if (marks[n] === undefined) marks[n] = Math.round(performance.now() - t0);
+    });
+  }
+
+  const watch = startStallWatch();
+  v.src = url;
+
+  const outcome = await new Promise<string>((resolve) => {
+    const timer = window.setTimeout(() => resolve("timeout"), timeoutMs);
+    v.addEventListener(
+      "canplay",
+      () => {
+        window.clearTimeout(timer);
+        resolve("canplay");
+      },
+      { once: true },
+    );
+    v.addEventListener(
+      "error",
+      () => {
+        window.clearTimeout(timer);
+        resolve("error");
+      },
+      { once: true },
+    );
+  });
+
+  // "卡死"的另一种表现是 play() 永远不 resolve —— 这里也量一下
+  let playError: string | null = null;
+  let playedTo = 0;
+  if (outcome === "canplay") {
+    try {
+      await v.play();
+      await new Promise((r) => window.setTimeout(r, 400));
+      playedTo = v.currentTime;
+      v.pause();
+    } catch (e) {
+      playError = String(e);
+    }
+  }
+
+  const err = v.error;
+  const after = await snap();
+  const out = {
+    id,
+    kind: assets[id]?.kind ?? null,
+    videoPath: detail?.video_path ?? null,
+    videoBytes: detail?.video_size ?? null,
+    stillBytes: detail?.still_size ?? null,
+    w: v.videoWidth,
+    h: v.videoHeight,
+    elementDurationMs: v.duration ? Math.round(v.duration * 1000) : null,
+    metaDurationMs: detail?.video_duration_ms ?? null,
+    outcome,
+    marks,
+    readyState: v.readyState,
+    networkState: v.networkState,
+    playedTo: Number(playedTo.toFixed(3)),
+    playError,
+    error: err ? { code: err.code, message: err.message } : null,
+    totalMs: Math.round(performance.now() - t0),
+    mainThreadMaxStallMs: watch.max,
+    mainThreadStalls: watch.count,
+    stallSamples: watch.samples,
+    protocol: before && after ? {
+      requests: after.requests - before.requests,
+      bytes: after.bytes - before.bytes,
+      readMsMax: after.readMsMax,
+      capped: after.capped - before.capped,
+      chunkLimit: after.chunkLimit,
+      // 媒体请求到达时缩略图队列里压着多少个 —— 用来证明"播放不会排在缩略图后面"
+      behindThumbMax: after.behindThumbMax,
+    } : null,
+  };
+
+  window.clearInterval(watch.timer);
+  v.pause();
+  v.removeAttribute("src");
+  v.load();
+  v.remove();
+  return out;
+}
+
+async function videoSweepSelfTest(limit: number, timeoutMs: number) {
+  const cands: number[] = [];
+  for (let i = 0; i < assets.length; i++) if (assets[i].kind !== "still") cands.push(i);
+  if (!cands.length) {
+    diag.videoSweep = { error: "库里没有视频资产" };
+    void flushDiag("video-sweep");
+    return;
+  }
+
+  // 先问一遍字节数：卡死与"一次读多大"高度相关，所以**从最大的开始测**。
+  const sized: Array<{ id: number; bytes: number; kind: string }> = [];
+  for (const id of cands) {
+    let bytes = 0;
+    try {
+      const d = await invoke<any>("asset_detail", { id });
+      bytes = d?.video_size ?? 0;
+    } catch {
+      /* 忽略 */
+    }
+    sized.push({ id, bytes, kind: assets[id].kind });
+  }
+  sized.sort((a, b) => b.bytes - a.bytes);
+
+  const half = Math.max(1, Math.floor(limit / 2));
+  const picked: Array<{ id: number; bytes: number; kind: string }> = sized.slice(0, half);
+  const rest = sized.slice(half);
+  const stride = Math.max(1, Math.floor(rest.length / Math.max(1, limit - picked.length)));
+  for (let i = 0; i < rest.length && picked.length < limit; i += stride) picked.push(rest[i]);
+
+  const results: unknown[] = [];
+  let worst: { id: number; stallMs: number } = { id: -1, stallMs: 0 };
+
+  // **先落盘候选清单再开测**：万一第一个文件就把进程干掉（实测老代码真的会崩），
+  // 至少能知道"凶手在名单里、按体积从大到小第一个"。
+  diag.videoSweep = {
+    limit,
+    timeoutMs,
+    total: assets.length,
+    videoAssets: cands.length,
+    tested: 0,
+    pickedCount: picked.length,
+    picked: picked.map((p) => ({ id: p.id, bytes: p.bytes, kind: p.kind })),
+    results,
+  };
+  await flushDiag("video-sweep");
+
+  for (let k = 0; k < picked.length; k++) {
+    const p = picked[k];
+    const r = await probeOneVideo(p.id, timeoutMs);
+    results.push(r);
+    if (r.mainThreadMaxStallMs > worst.stallMs) {
+      worst = { id: p.id, stallMs: r.mainThreadMaxStallMs };
+    }
+    note(
+      `sweep ${k + 1}/${picked.length} id=${p.id} ${p.bytes} B → ${r.outcome} ${r.totalMs}ms stall=${r.mainThreadMaxStallMs}ms ` +
+        `req=${(r as any).protocol?.requests ?? "?"} bytes=${(r as any).protocol?.bytes ?? "?"}`,
+    );
+    // 每测一个就落盘：真卡死了，这一行就是证据
+    diag.videoSweep = {
+      limit,
+      timeoutMs,
+      total: assets.length,
+      videoAssets: cands.length,
+      tested: k + 1,
+      pickedCount: picked.length,
+      worstStall: worst,
+      results,
+    };
+    await flushDiag("video-sweep");
+  }
+
+  const bad = results.filter((r: any) => r.outcome !== "canplay");
+  diag.videoSweep = {
+    limit,
+    timeoutMs,
+    total: assets.length,
+    videoAssets: cands.length,
+    tested: picked.length,
+    pickedCount: picked.length,
+    worstStall: worst,
+    badCount: bad.length,
+    bad: bad.map((r: any) => ({
+      id: r.id,
+      bytes: r.videoBytes,
+      outcome: r.outcome,
+      error: r.error,
+    })),
+    results,
+  };
+  note(`videoSweep 完成 测试 ${picked.length} 个 失败 ${bad.length} 个 最差停顿 ${worst.stallMs}ms`);
+  void flushDiag("video-sweep");
+}
+
 void (async () => {
   await initEvents();
   window.setInterval(() => {
@@ -1878,6 +2234,17 @@ void (async () => {
       window.setTimeout(() => void mediaSelfTest(), 3200);
       window.setTimeout(() => liveSelfTest(), 9000);
       window.setTimeout(() => void screenSelfTest(), 15000);
+      // 视频扫描：由环境变量 LIVEPHOTO_SWEEP 打开（默认关闭）
+      try {
+        const plan = await invoke<{ enabled: boolean; limit: number; timeoutMs: number }>(
+          "probe_plan",
+        );
+        if (plan?.enabled) {
+          window.setTimeout(() => void videoSweepSelfTest(plan.limit, plan.timeoutMs), 22000);
+        }
+      } catch {
+        /* 命令不存在（旧版后端）就跳过 */
+      }
     }
   } catch (e) {
     diag.lastError = `自动打开失败: ${e}`;
