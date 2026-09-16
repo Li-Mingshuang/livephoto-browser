@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LivePhoto 浏览器</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <header id="bar">
+      <button id="toggleSide" title="显示/隐藏侧栏">☰</button>
+      <span class="brand">LivePhoto</span>
+      <input id="path" type="text" value="F:\DCIM" spellcheck="false" />
+      <button id="open" class="primary">打开</button>
+      <button id="zoomOut" title="缩小 (Ctrl+滚轮)">−</button>
+      <button id="zoomIn" title="放大 (Ctrl+滚轮)">＋</button>
+      <button id="refresh">统计</button>
+      <span id="status" class="dim">就绪 · 只读浏览，不会移动或修改任何照片</span>
+    </header>
+
+    <div id="main">
+      <aside id="side">
+        <div class="side-head">
+          <span class="dim">文件夹</span>
+        </div>
+        <div id="tree"></div>
+      </aside>
+
+      <div id="gridWrap">
+        <div id="sticky"></div>
+        <div id="grid" tabindex="0">
+          <div id="spacer"><div id="window"></div></div>
+        </div>
+        <div id="timeline" title="拖动跳到某个月"></div>
+      </div>
+    </div>
+
+    <div id="empty">
+      <b>输入文件夹路径后点「打开」</b>
+      <span class="dim">例如 F:\DCIM —— 直接浏览该目录下的照片与 Live Photo</span>
+      <span class="dim">只读浏览：不会导入、复制、移动或修改任何文件</span>
+    </div>
+
+    <aside id="stats" class="hidden">
+      <div class="row"><b>运行统计</b></div>
+      <pre id="statsBody"></pre>
+    </aside>
+
+    <div id="detail" class="hidden">
+      <div class="row"><b id="dTitle">—</b></div>
+      <pre id="dBody"></pre>
+    </div>
+
+    <div id="viewer" class="hidden">
+      <div id="vTop">
+        <span id="vTitle">—</span>
+        <span id="vMeta" class="dim"></span>
+        <span id="vZoom" class="dim"></span>
+        <span id="vQuality" class="dim"></span>
+        <button id="vClose" title="关闭 (Esc)">✕</button>
+      </div>
+      <div id="vStage">
+        <img id="vImg" alt="" draggable="false" />
+        <video id="vVid" class="hidden" playsinline preload="none"></video>
+      </div>
+      <div id="vHint" class="dim">
+        <button id="vLive" class="hidden">LIVE ▶</button>
+        <button id="vMute" class="hidden">🔊</button>
+        <span id="vHintText">滚轮缩放 · 拖动平移 · 双击复位 · 空格播放 · ←→切换 · Esc 关闭</span>
+      </div>
+      <!-- 底部胶片条：显示前后几张的预加载状态，切快了也有心理预期 -->
+      <div id="vStrip"></div>
+    </div>
+
+    <!-- 网格悬停预览用的共享 video（Apple 相册那样：悬停就静音播一遍） -->
+    <video id="hoverVid" playsinline muted preload="auto"></video>
+  </body>
+</html>

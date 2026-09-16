@@ -1,0 +1,25 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+
+# Node
+node_modules/
+.pnpm-store/
+.npm-cache/
+
+# 前端构建产物（由 pnpm build 生成，不入库）
+app/dist/
+
+# 实测数据与临时产物（体积大、且可由 bench 复现）
+m0-results/
+
+# 发布产物（作为 GitHub Release 资产，不入库）
+release/
+
+# 编辑器 / 系统
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,28 @@
+[package]
+name = "livephoto-core"
+version = "0.1.0"
+edition = "2021"
+description = "LivePhoto 浏览器的核心层：解码 / 索引 / 缓存 / 推理（不依赖 Tauri）"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+fast_image_resize = "6.1.0"
+rayon = "1.12.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_WindowsProgramming",
+    "Win32_Graphics_Imaging",
+    "Win32_Media",
+    "Win32_Media_MediaFoundation",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell_PropertiesSystem",
+] }

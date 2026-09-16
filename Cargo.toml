@@ -1,0 +1,17 @@
+[workspace]
+members = ["core", "app/src-tauri"]
+resolver = "2"
+
+# Tauri 官方建议的体积/性能配置（members 内的同名配置会被忽略，必须放这里）
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+# bench 需要真实的优化水平，否则量出来的数字没有意义
+[profile.bench]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
