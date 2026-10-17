@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "app",
-  "version": "0.1.0",
+  "productName": "LivePhoto 浏览器",
+  "version": "0.1.1",
   "identifier": "com.lms.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -26,6 +26,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "Li Mingshuang",
+    "copyright": "MIT License",
+    "shortDescription": "Windows 上最好用的 iPhone Live Photo 浏览器",
+    "longDescription": "只读浏览 iPhone 导出的 Live Photo：不导入、不复制、不改动任何照片。网格悬停即预览，点一下带声音播放，零转码。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
