@@ -7,6 +7,12 @@
 Windows 自带的「照片」把 Live Photo 显示成一张静态 HEIC，资源管理器把 `IMG_1234.HEIC`
 和 `IMG_1234.MOV` 当成两个互不关联的文件。这个工具把它们配回一张会动的照片。
 
+![网格视图](docs/screenshots/grid.png)
+
+![全屏查看](docs/screenshots/viewer.png)
+
+> 截图为合成示例库（渐变色块生成的 14 张测试图），不含任何真实照片。
+
 ---
 
 ## 能做什么
@@ -45,6 +51,17 @@ cd ..; cargo build --release -p app --features custom-protocol
 
 构建产物体积、图标生成、性能实测数据等开发者向细节，见
 [`docs/实施记录.md`](docs/实施记录.md) 与 [`docs/M0-实测发现.md`](docs/M0-实测发现.md)。
+
+### 图标
+
+`python tools/gen-icon.py --variant rf-halftone` 生成：奶油纸底、彩色像素点按拉丁方交错排列
+（任意相邻点颜色都不同）、中心一圈同心环。一次输出 **9 个尺寸**（16–256）的 `icon.ico`
+与各尺寸 png。
+
+`tools/gen-icon.py` 里另有十余个备选变体（花瓣、胶片、CRT、包豪斯、网点、六角星、相机等），
+`--sheet` 可以直接出对比图，改配色只需改调色板常量。
+修改图标后需更新 `app/src-tauri/tauri.conf.json` 的时间戳再构建
+（`tauri-build` 的 `rerun-if-changed` 不包含图标文件，否则 exe 会静默保留旧图标）。
 
 ## 已知限制
 

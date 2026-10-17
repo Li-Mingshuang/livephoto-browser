@@ -12,6 +12,7 @@
 """
 import base64
 import json
+import os
 import subprocess
 import sys
 import urllib.error
@@ -21,6 +22,13 @@ from pathlib import Path
 OWNER = sys.argv[1] if len(sys.argv) > 1 else "Li-Mingshuang"
 REPO = sys.argv[2] if len(sys.argv) > 2 else "livephoto-browser"
 BRANCH = "master"
+
+# 清掉可能被污染的 GIT_CONFIG_* 环境变量。
+# 这台机器上环境中存在重复的 GIT_CONFIG_COUNT/KEY 组合（大小写重复项），
+# 导致 git 直接失败："error: missing config key GIT_CONFIG_KEY_0"，
+# 于是 `git ls-files` 也拿不到文件列表。脚本自己清一遍最省事。
+for _k in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"):
+    os.environ.pop(_k, None)
 
 ROOT = Path(__file__).resolve().parent.parent
 API = f"https://api.github.com/repos/{OWNER}/{REPO}"
