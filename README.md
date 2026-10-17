@@ -122,6 +122,22 @@ cd app; pnpm dev                       # 终端 1
 $env:LIVEPHOTO_OPEN="F:\DCIM"; .\target\debug\app.exe   # 终端 2
 ```
 
+### 构建产物体积（实测，别被 `target/` 吓到）
+
+**运行只需要一个 `LivePhotoBrowser.exe`（4.57 MB）** —— `target/` 是编译器的中间缓存，
+删了照跑，只是下次要重编。它的真实量级：
+
+| 状态 | `target/` | 文件数 | 冷构建耗时 |
+|---|---|---|---|
+| 干净构建（快档 `LTO=false`，246 个 crate） | **1.77 GB** | 3,679 | **14 分 11 秒** |
+| 再删掉 `*.pdb`（只有调试器要用） | **1.52 GB** | 3,569 | — |
+| 反面教材：反复用环境变量覆盖 profile 混着构建 | 3.94 GB | 8,421 | — |
+
+表格最后一行是真踩过的坑：每次改 `CARGO_PROFILE_RELEASE_LTO` / `OPT_LEVEL` 这类覆盖，
+crate 的 hash 就会变，同一批依赖被**再编一份**，旧的那份留在 `target/deps` 里不删。
+实测堆到 775 个 `.rlib`（干净构建只有 360 个），多出 **2.4 GB 纯垃圾**。
+**要么统一用 `Cargo.toml` 里的 profile，要么换设置前先 `cargo clean`。**
+
 ---
 
 ## 技术栈与结构
