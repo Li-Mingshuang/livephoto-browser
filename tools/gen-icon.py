@@ -1,6 +1,6 @@
 """生成 app 图标（多尺寸 .ico + 各尺寸 png）。
 
-为什么要用脚本生成而不是找个图标：
+为什么用脚本生成：
   1. 可复现 —— 任何时候 `python tools/gen-icon.py` 都得到同样的图标；
   2. 没有版权顾虑（自己画的）；
   3. 尺寸齐全 —— Windows 在 16/20/24/32/40/48/64/128/256 不同位置用不同尺寸，
@@ -8,16 +8,16 @@
 
 设计（1024 画布，超采样后下采样，边缘自然抗锯齿）：
   - 圆角方块（近似 Apple squircle）+ 蓝→青对角渐变 + 顶部柔光
-  - 白色播放三角（圆角，用"模糊后阈值化"得到圆角，而不是画粗折线）
-  - 一圈约 300° 的白色圆环（暗示 Live / 回放），缺口朝右上
-理由：16px 下能看清的只有"蓝底 + 白三角"，所以主体必须是这两样；
-圆环只在大尺寸提供"会动的照片"的暗示，小尺寸糊掉也不影响识别。
+  - 白色播放三角（圆角用"先高斯模糊再阈值化"得到）
+  - 左上角一个"实况照片"标记：两个同心圆环 + 中心圆点（iOS 实况照片的记号）
+
+构图意图：三角说"会播放"，同心圆说"这是实况照片"，两者分开摆，
+小尺寸先糊掉角上的圆环、留下蓝底 + 白三角，识别依然成立。
 
 用法：python tools/gen-icon.py
 """
 from __future__ import annotations
 
-import math
 import sys
 from pathlib import Path
 
@@ -76,20 +76,18 @@ def play_triangle() -> Image.Image:
     return blur_round(layer, 0.022 * C)
 
 
-def live_ring() -> Image.Image:
-    """300° 白色圆环，缺口朝右上。"""
+def live_badge() -> Image.Image:
+    """左上角的"实况照片"标记：两个同心圆环 + 中心圆点（iOS 实况照片的那个记号）。
+
+    这个记号是"会动的照片"最直接的语义。放在角上，小尺寸糊掉也不影响主体识别。
+    """
     layer = Image.new("L", (C, C), 0)
     d = ImageDraw.Draw(layer)
-    r = int(0.385 * C)
-    box = [C // 2 - r, C // 2 - r, C // 2 + r, C // 2 + r]
-    width = int(0.028 * C)
-    d.arc(box, start=-58, end=242, fill=255, width=width)
-    # 圆头：在弧的两个端点各补一个小圆
-    for deg in (-58, 242):
-        a = math.radians(deg)
-        px, py = C // 2 + r * math.cos(a), C // 2 + r * math.sin(a)
-        rr = width // 2
-        d.ellipse([px - rr, py - rr, px + rr, py + rr], fill=255)
+    cx = cy = int(0.255 * C)
+    for r, w in ((int(0.088 * C), int(0.020 * C)), (int(0.050 * C), int(0.020 * C))):
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=255, width=w)
+    rr = int(0.018 * C)
+    d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=255)
     return layer
 
 
@@ -106,7 +104,7 @@ def compose() -> Image.Image:
     icon = Image.new("RGBA", (C, C), (0, 0, 0, 0))
     icon.paste(bg, (0, 0), mask)
 
-    glyph = ImageChops.lighter(live_ring(), play_triangle())
+    glyph = ImageChops.lighter(live_badge(), play_triangle())
     glyph = ImageChops.multiply(glyph, mask)          # 不超出圆角
     white = Image.new("RGBA", (C, C), (255, 255, 255, 0))
     white.putalpha(glyph)
